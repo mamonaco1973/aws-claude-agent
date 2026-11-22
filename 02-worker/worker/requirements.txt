@@ -1,0 +1,2 @@
+# EnvironmentWorker first shipped in 0.103.0; pinned to the tested release.
+anthropic==2.12.0

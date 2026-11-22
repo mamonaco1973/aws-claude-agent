@@ -4,33 +4,34 @@
 # ==============================================================================
 # ENVIRONMENT VALIDATION SCRIPT
 # ==============================================================================
-# Validates that all required CLI tools are available in the PATH and that
-# AWS credentials are configured correctly before running Terraform.
+# Confirms the build server has every tool and credential the lab needs
+# before anything is created.
 #
 # High-level flow:
 #   1) Verify required commands exist in PATH.
-#   2) Fail fast if any command is missing.
-#   3) Validate AWS CLI authentication using STS.
+#   2) Verify ANTHROPIC_API_KEY is set (control-plane calls only).
+#   3) Verify AWS credentials with STS and that Docker is running.
 #
 # Notes:
-# - This script is intentionally verbose to aid troubleshooting.
-# - Any failure causes the script to exit with a non-zero status.
+# - ANTHROPIC_API_KEY stays on this machine. The worker in AWS only ever
+#   gets the narrower environment key.
 # ==============================================================================
+
+set -euo pipefail
 
 echo "NOTE: Validating that required commands are found in your PATH."
 
 # ------------------------------------------------------------------------------
-# REQUIRED COMMAND CHECK
+# REQUIRED COMMANDS
 # ------------------------------------------------------------------------------
-# List of commands required for this project to function correctly.
+# ant drives the Managed Agents control plane (ant apply, deployments,
+# work-queue stats); python3 runs the session streamer in run-now.sh;
+# envsubst renders the agent template.
 # ------------------------------------------------------------------------------
 
-commands=("aws" "terraform" "jq")
-
-# Flag indicating whether all required commands were found
+commands=("aws" "terraform" "docker" "jq" "ant" "python3" "envsubst")
 all_found=true
 
-# Iterate through required commands and verify availability
 for cmd in "${commands[@]}"; do
   if ! command -v "$cmd" &> /dev/null; then
     echo "ERROR: $cmd is not found in the current PATH."
@@ -40,34 +41,40 @@ for cmd in "${commands[@]}"; do
   fi
 done
 
-# ------------------------------------------------------------------------------
-# COMMAND VALIDATION RESULT
-# ------------------------------------------------------------------------------
-# Abort execution if any required command is missing.
-# ------------------------------------------------------------------------------
-
 if [ "$all_found" = true ]; then
   echo "NOTE: All required commands are available."
 else
   echo "ERROR: One or more required commands are missing."
+  echo "ERROR: Install ant from github.com/anthropics/anthropic-cli/releases."
   exit 1
 fi
 
 # ------------------------------------------------------------------------------
-# AWS AUTHENTICATION CHECK
+# ANTHROPIC API KEY
 # ------------------------------------------------------------------------------
-# Validate AWS CLI authentication using STS.
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "ERROR: ANTHROPIC_API_KEY is not set."
+  echo "ERROR: Export a Claude API key for the control-plane calls."
+  exit 1
+fi
+echo "NOTE: ANTHROPIC_API_KEY is set (used on this machine only)."
+
+# ------------------------------------------------------------------------------
+# AWS AND DOCKER
 # ------------------------------------------------------------------------------
 
 echo "NOTE: Checking AWS CLI connection."
-
-aws sts get-caller-identity --query "Account" --output text >> /dev/null
-
-# Abort execution if AWS authentication fails.
-if [ $? -ne 0 ]; then
+if ! aws sts get-caller-identity --query Account --output text > /dev/null
+then
   echo "ERROR: Failed to connect to AWS."
   echo "ERROR: Check credentials and environment variables."
   exit 1
-else
-  echo "NOTE: Successfully authenticated to AWS."
 fi
+echo "NOTE: Successfully authenticated to AWS."
+
+if ! docker info > /dev/null 2>&1; then
+  echo "ERROR: Docker is not running or not reachable."
+  exit 1
+fi
+echo "NOTE: Docker is running."

@@ -1,0 +1,23 @@
+#!/bin/bash
+# ==============================================================================
+# FILE: psql-iam
+# ==============================================================================
+# psql with an IAM auth token instead of a password.
+#
+# The token is a 15-minute SigV4 signature made with the ECS task role, so
+# a fresh one is minted on every call and none is ever stored. PGHOST,
+# PGUSER, PGDATABASE and the TLS settings come from the task definition.
+#
+# Usage: psql-iam [any psql arguments]
+# ==============================================================================
+
+set -euo pipefail
+
+PGPASSWORD="$(aws rds generate-db-auth-token \
+  --hostname "$PGHOST" \
+  --port "${PGPORT:-5432}" \
+  --username "$PGUSER" \
+  --region "$AWS_REGION")"
+export PGPASSWORD
+
+exec psql "$@"

@@ -2,124 +2,95 @@
 # ==============================================================================
 # FILE: validate.sh
 # ==============================================================================
-# PURPOSE:
-#   Resolves and prints the public pgweb endpoint for an EC2 instance
-#   providing a lightweight web UI for PostgreSQL database access.
+# Proves the lab works end to end and that nothing is exposed.
 #
-# WHAT THIS SCRIPT DOES:
-#   1) Looks up a running EC2 instance by its Name tag.
-#   2) Extracts the instance's PublicDnsName.
-#   3) Fails fast if the instance has no public DNS (or is not found).
-#   4) Prints the resulting pgweb URL for quick validation.
-#
-# PREREQUISITES:
-#   - AWS CLI installed and configured with permissions for ec2:DescribeInstances
-#   - The target EC2 instance exists, is running, and has a public DNS name
-#     (i.e., it is in a public subnet with a public IPv4 / EIP).
-#
-# NOTES:
-#   - This script assumes pgweb is served from the web root ("/").
-#   - If multiple instances share the same Name tag, the first match is used.
+# High-level flow:
+#   1) The work queue reports at least one worker polling (asked from this
+#      machine with the API key, never from the worker).
+#   2) run-now.sh runs one audit session to completion.
+#   3) The newest report is in S3; print its title and headline.
+#   4) The worker task has no public IP and its security group has zero
+#      ingress rules.
 # ==============================================================================
 
 set -euo pipefail
+cd "$(dirname "$0")"
+source ./lib.sh
 
-# ------------------------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------------------------
-# AWS region where the pgweb EC2 instance is running.
-AWS_REGION="us-east-2"
+ENV_ID=$(lock_id environment.yaml)
+BUCKET=$(terraform -chdir=01-rds output -raw reports_bucket)
+CLUSTER=$(terraform -chdir=02-worker output -raw cluster_name)
+SERVICE=$(terraform -chdir=02-worker output -raw service_name)
+WORKER_SG=$(terraform -chdir=02-worker output -raw worker_sg_id)
 
-# ------------------------------------------------------------------------------
-# RESOLVE PGWEB ENDPOINT
-# ------------------------------------------------------------------------------
-# Expected EC2 Name tag value for the pgweb host.
-PGWEB_INSTANCE_NAME="pgweb-deployment"
-
-# ------------------------------------------------------------------------------
-# FUNCTION: get_public_dns
-# ------------------------------------------------------------------------------
-# Returns the public DNS name for the first running EC2 instance whose Name tag
-# matches the provided value.
-#
-# Args:
-#   $1: instance_name  (value of the Name tag)
-#
-# Output:
-#   Writes the PublicDnsName to stdout (or "None" if not present).
-get_public_dns() {
-  local instance_name="$1"
-
-  aws ec2 describe-instances \
-    --region "${AWS_REGION}" \
-    --filters \
-      "Name=tag:Name,Values=${instance_name}" \
-      "Name=instance-state-name,Values=running" \
-    --query 'Reservations[0].Instances[0].PublicDnsName' \
-    --output text
-}
-
-# Resolve public DNS name for the pgweb host.
-PGWEB_PUBLIC_DNS=$(get_public_dns "${PGWEB_INSTANCE_NAME}")
-
-# ------------------------------------------------------------------------------
-# VALIDATION
-# ------------------------------------------------------------------------------
-# Fail fast if the instance is missing a public DNS name (not found, stopped,
-# or running without a public interface).
-if [[ -z "${PGWEB_PUBLIC_DNS}" || "${PGWEB_PUBLIC_DNS}" == "None" ]]; then
-  echo "ERROR: ${PGWEB_INSTANCE_NAME} has no public DNS name"
+# ==============================================================================
+# CHECK 1: A WORKER IS POLLING
+# ==============================================================================
+echo "NOTE: Checking the work queue for $ENV_ID."
+POLLING=0
+for _ in $(seq 1 18); do
+  POLLING=$(ant beta:environments:work stats --environment-id "$ENV_ID" \
+    --transform workers_polling -r)
+  [ "${POLLING:-0}" -ge 1 ] && break
+  sleep 10
+done
+ant beta:environments:work stats --environment-id "$ENV_ID" \
+  --transform '{workers_polling,depth,pending}' --format json
+if [ "${POLLING:-0}" -lt 1 ]; then
+  echo "ERROR: No worker is polling the environment."
   exit 1
 fi
+echo "NOTE: $POLLING worker(s) polling."
 
-# ------------------------------------------------------------------------------
-# DATABASE ENDPOINT RESOLUTION
-# ------------------------------------------------------------------------------
-# Resolve database connection endpoints used by pgweb.
-#
-# These endpoints are NOT required for pgweb to start, but are printed for
-# convenience so the operator can easily copy/paste them when connecting
-# pgweb to either backend.
-#
-# Both endpoints are resolved dynamically from AWS to avoid hardcoding
-# DNS names that may change across environments.
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# CHECK 2: ONE AUDIT, START TO FINISH
+# ==============================================================================
+echo "NOTE: Running the audit now."
+./run-now.sh
 
-# Aurora PostgreSQL cluster identifier (Terraform-managed)
-# This should match the aws_rds_cluster identifier exactly.
-CLUSTER_ID="aurora-postgres-cluster"
+# ==============================================================================
+# CHECK 3: THE REPORT IS IN S3
+# ==============================================================================
+KEY=$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix reports/ \
+  --query 'sort_by(Contents, &LastModified)[-1].Key' --output text)
+if [ -z "$KEY" ] || [ "$KEY" = "None" ]; then
+  echo "ERROR: No report found under s3://$BUCKET/reports/."
+  exit 1
+fi
+echo "NOTE: Newest report is s3://$BUCKET/$KEY"
+echo "------------------------------------------------------------------"
+aws s3 cp "s3://$BUCKET/$KEY" - | \
+  awk '/^# /{print; next} /^## Headline/{h=1; print; next}
+       /^## /{h=0} h && NF {print}' | cut -c1-90
+echo "------------------------------------------------------------------"
 
-# Resolve the Aurora PostgreSQL writer endpoint.
-# pgweb should always connect to the writer endpoint when targeting Aurora.
-AURORA_ENDPOINT=$(aws rds describe-db-clusters \
-  --region "${AWS_REGION}" \
-  --db-cluster-identifier "${CLUSTER_ID}" \
-  --query 'DBClusters[0].Endpoint' \
+# ==============================================================================
+# CHECK 4: NOTHING EXPOSED
+# ==============================================================================
+TASK_ARN=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+  --desired-status RUNNING --query 'taskArns[0]' --output text)
+ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+  --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
   --output text)
-
-# Resolve the standalone RDS PostgreSQL instance endpoint.
-# This is the primary connection address for the RDS-backed deployment.
-RDS_ENDPOINT=$(aws rds describe-db-instances \
-  --region "${AWS_REGION}" \
-  --db-instance-identifier "postgres-rds-instance" \
-  --query "DBInstances[0].Endpoint.Address" \
+read -r PRIVATE_IP PUBLIC_IP < <(aws ec2 describe-network-interfaces \
+  --network-interface-ids "$ENI" \
+  --query 'NetworkInterfaces[0].[PrivateIpAddress, Association.PublicIp]' \
   --output text)
+INGRESS=$(aws ec2 describe-security-groups --group-ids "$WORKER_SG" \
+  --query 'length(SecurityGroups[0].IpPermissions)' --output text)
 
-# ------------------------------------------------------------------------------
-# DISPLAY RESULTS
-# ------------------------------------------------------------------------------
+echo "NOTE: Worker ENI $ENI"
+echo "NOTE:   private IP: $PRIVATE_IP"
+echo "NOTE:   public IP:  $PUBLIC_IP"
+echo "NOTE: Worker security group $WORKER_SG"
+echo "NOTE:   ingress rules: $INGRESS"
+aws ec2 describe-security-groups --group-ids "$WORKER_SG" \
+  --query 'SecurityGroups[0].IpPermissionsEgress[].[IpProtocol, ToPort,
+           join(`,`, [IpRanges[].CidrIp, UserIdGroupPairs[].GroupId][])]' \
+  --output text | awk '{printf "NOTE:   egress: %s %s -> %s\n", $1, $2, $3}'
 
-echo "=========================================================================="
-echo " PROJECT ENDPOINTS"
-echo "=========================================================================="
-echo
-echo " PGWEB Application:"
-echo "   http://${PGWEB_PUBLIC_DNS}"
-echo
-echo " RDS Instance:"
-echo "   ${RDS_ENDPOINT}"
-echo
-echo " Aurora Instance:"
-echo "   ${AURORA_ENDPOINT}"
-echo
-echo "=========================================================================="
+if [ "$PUBLIC_IP" != "None" ] || [ "$INGRESS" != "0" ]; then
+  echo "ERROR: The worker is exposed."
+  exit 1
+fi
+echo "NOTE: No public IP, no ingress. Validation passed."

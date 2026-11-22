@@ -1,135 +1,143 @@
 # ===============================================================================
-# VPC CONFIGURATION FOR RDS INFRASTRUCTURE
+# VPC: PUBLIC EDGE, PRIVATE WORKLOADS
 # ===============================================================================
-# Defines the networking foundation required for RDS and Aurora resources,
-# including the VPC, public subnets, routing, and internet connectivity.
+# The public subnets exist only to hold the NAT gateway. The database, the
+# loader host and the agent worker all sit in the private subnets: they can
+# reach out (Anthropic, AWS APIs, package mirrors) but nothing can reach in.
 # ===============================================================================
 
-resource "aws_vpc" "rds-vpc" {
-
-  # IPv4 CIDR block for the VPC
-  cidr_block = "10.0.0.0/24"
-
-  # Enable internal DNS resolution
-  enable_dns_support = true
-
-  # Enable DNS hostnames for EC2 instances
+resource "aws_vpc" "agent" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = {
-    Name          = "rds-vpc"
-    ResourceGroup = "rds-asg-rg"
+    Name = "claude-agent-vpc"
   }
 }
 
-# ===============================================================================
-# INTERNET GATEWAY
-# ===============================================================================
-# Provides outbound internet access for resources within the VPC.
-# ===============================================================================
-
-resource "aws_internet_gateway" "rds-igw" {
-
-  # Attach the internet gateway to the VPC
-  vpc_id = aws_vpc.rds-vpc.id
+resource "aws_internet_gateway" "agent" {
+  vpc_id = aws_vpc.agent.id
 
   tags = {
-    Name = "rds-igw"
+    Name = "claude-agent-igw"
   }
 }
 
-# ===============================================================================
-# PUBLIC ROUTE TABLE
-# ===============================================================================
-# Routes outbound traffic from public subnets to the internet gateway.
-# ===============================================================================
+# ------------------------------------------------------------------------------
+# PUBLIC SUBNETS (NAT ONLY)
+# ------------------------------------------------------------------------------
+# No instance, task or database is ever placed here. Public IPs are not
+# auto-assigned, so even a mistake would not expose anything by default.
+# ------------------------------------------------------------------------------
+
+resource "aws_subnet" "public" {
+  count             = 2
+  vpc_id            = aws_vpc.agent.id
+  cidr_block        = "10.0.${count.index}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "claude-agent-public-${count.index + 1}"
+  }
+}
 
 resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.agent.id
 
-  # Associate route table with the VPC
-  vpc_id = aws_vpc.rds-vpc.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.agent.id
+  }
 
   tags = {
-    Name = "public-route-table"
+    Name = "claude-agent-public-rt"
   }
 }
 
-resource "aws_route" "default_route" {
-
-  # Target route table
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
-
-  # Catch-all IPv4 route
-  destination_cidr_block = "0.0.0.0/0"
-
-  # Forward traffic to the internet gateway
-  gateway_id = aws_internet_gateway.rds-igw.id
 }
 
-# ===============================================================================
-# PUBLIC SUBNETS
-# ===============================================================================
-# Defines public subnets across multiple availability zones.
-# ===============================================================================
+# ------------------------------------------------------------------------------
+# NAT GATEWAY
+# ------------------------------------------------------------------------------
+# One NAT in one AZ keeps the lab cheap. It is the only path to the internet
+# for the private subnets, and it only carries connections that start inside.
+# ------------------------------------------------------------------------------
 
-resource "aws_subnet" "rds-subnet-1" {
-
-  # Parent VPC
-  vpc_id = aws_vpc.rds-vpc.id
-
-  # CIDR block for subnet
-  cidr_block = "10.0.0.0/26"
-
-  # Assign public IPs on launch
-  map_public_ip_on_launch = true
-
-  # Availability zone placement
-  availability_zone = "us-east-2a"
+resource "aws_eip" "nat" {
+  domain = "vpc"
 
   tags = {
-    Name = "rds-subnet-1"
+    Name = "claude-agent-nat-eip"
   }
 }
 
-resource "aws_subnet" "rds-subnet-2" {
-
-  # Parent VPC
-  vpc_id = aws_vpc.rds-vpc.id
-
-  # CIDR block for subnet
-  cidr_block = "10.0.0.64/26"
-
-  # Assign public IPs on launch
-  map_public_ip_on_launch = true
-
-  # Availability zone placement
-  availability_zone = "us-east-2b"
+resource "aws_nat_gateway" "agent" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
 
   tags = {
-    Name = "rds-subnet-2"
+    Name = "claude-agent-nat"
+  }
+
+  depends_on = [aws_internet_gateway.agent]
+}
+
+# ------------------------------------------------------------------------------
+# PRIVATE SUBNETS
+# ------------------------------------------------------------------------------
+# Two AZs because an RDS subnet group requires them, even for a single-AZ
+# instance.
+# ------------------------------------------------------------------------------
+
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.agent.id
+  cidr_block        = "10.0.${count.index + 10}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "claude-agent-private-${count.index + 1}"
   }
 }
 
-# ===============================================================================
-# ROUTE TABLE ASSOCIATIONS
-# ===============================================================================
-# Associates public subnets with the public route table.
-# ===============================================================================
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.agent.id
 
-resource "aws_route_table_association" "public_rta_1" {
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.agent.id
+  }
 
-  # Subnet association
-  subnet_id = aws_subnet.rds-subnet-1.id
-
-  # Route table assignment
-  route_table_id = aws_route_table.public.id
+  tags = {
+    Name = "claude-agent-private-rt"
+  }
 }
 
-resource "aws_route_table_association" "public_rta_2" {
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
 
-  # Subnet association
-  subnet_id = aws_subnet.rds-subnet-2.id
+# ------------------------------------------------------------------------------
+# S3 GATEWAY ENDPOINT
+# ------------------------------------------------------------------------------
+# Free, and it keeps report uploads and the seed download off the NAT
+# gateway's per-GB processing charge.
+# ------------------------------------------------------------------------------
 
-  # Route table assignment
-  route_table_id = aws_route_table.public.id
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.agent.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+
+  tags = {
+    Name = "claude-agent-s3-endpoint"
+  }
 }

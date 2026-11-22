@@ -1,0 +1,10 @@
+# ==============================================================================
+# MANAGED AGENTS ENVIRONMENT: SELF-HOSTED
+# ==============================================================================
+# "self_hosted" is the whole config: no networking or capacity settings,
+# because the sandbox is our Fargate task and its network is our VPC.
+# Synced by `ant apply` from apply.sh; its ID lands in claude-lock.json.
+# ==============================================================================
+name: claude-agent-aws-worker
+config:
+  type: self_hosted

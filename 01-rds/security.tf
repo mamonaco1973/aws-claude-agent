@@ -1,91 +1,69 @@
 # ===============================================================================
-# SECURITY GROUP FOR POSTGRESQL (PORT 5432)
+# SECURITY GROUPS
 # ===============================================================================
-# Defines network access rules for PostgreSQL traffic and unrestricted
-# outbound connectivity within the RDS VPC.
+# The database accepts 5432 only from named security groups, never from a
+# CIDR. Phase 02 adds the worker's rule to rds_sg; this phase adds only the
+# loader's.
 # ===============================================================================
 
 resource "aws_security_group" "rds_sg" {
-
-  # Name of the security group
-  name = "rds-sg"
-
-  # Description of allowed traffic
-  description = "Allow PostgreSQL inbound access and all outbound traffic"
-
-  # Associate the security group with the RDS VPC
-  vpc_id = aws_vpc.rds-vpc.id
-
-  # -----------------------------------------------------------------------------
-  # INBOUND RULES
-  # -----------------------------------------------------------------------------
-
-  # Allow PostgreSQL traffic from any IPv4 address
-  ingress {
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # -----------------------------------------------------------------------------
-  # OUTBOUND RULES
-  # -----------------------------------------------------------------------------
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  name        = "claude-agent-rds-sg"
+  description = "PostgreSQL, reachable only from named security groups"
+  vpc_id      = aws_vpc.agent.id
 
   tags = {
-    Name = "rds-sg"
+    Name = "claude-agent-rds-sg"
   }
 }
 
-# --------------------------------------------------------------------------------
-# RESOURCE: aws_security_group.http_sg
-# --------------------------------------------------------------------------------
-# Description:
-#   Security group for a web-facing component that serves HTTP traffic
-#   on TCP port 80 (e.g., EC2, ALB, or containerized web service).
-#
-# Security:
-#   Public HTTP access is acceptable only when paired with proper
-#   hardening, authentication, and patching.
-# --------------------------------------------------------------------------------
-resource "aws_security_group" "http_sg" {
-  name        = "http-sg"
-  description = "Allow HTTP (80) inbound traffic and unrestricted egress."
-  vpc_id      = aws_vpc.rds-vpc.id
+# ------------------------------------------------------------------------------
+# LOADER HOST
+# ------------------------------------------------------------------------------
+# No ingress at all: the loader is reached through SSM Session Manager,
+# which is itself an outbound connection from the instance.
+# ------------------------------------------------------------------------------
 
-  # ------------------------------------------------------------------------------
-  # INGRESS: HTTP (TCP/80)
-  # ------------------------------------------------------------------------------
-  # Allows inbound HTTP traffic from any IPv4 address.
-  # ------------------------------------------------------------------------------
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # ------------------------------------------------------------------------------
-  # EGRESS: All traffic
-  # ------------------------------------------------------------------------------
-  # Allows outbound access to backend services such as RDS or external APIs.
-  # ------------------------------------------------------------------------------
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_security_group" "loader_sg" {
+  name        = "claude-agent-loader-sg"
+  description = "Seed loader: no ingress, outbound only"
+  vpc_id      = aws_vpc.agent.id
 
   tags = {
-    Name = "http-sg"
+    Name = "claude-agent-loader-sg"
   }
+}
+
+# HTTPS out for dnf, S3, Secrets Manager and SSM.
+resource "aws_vpc_security_group_egress_rule" "loader_https" {
+  security_group_id = aws_security_group.loader_sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
+# HTTP out because the Amazon Linux package mirrors are fetched over 80.
+resource "aws_vpc_security_group_egress_rule" "loader_http" {
+  security_group_id = aws_security_group.loader_sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 80
+  to_port           = 80
+}
+
+resource "aws_vpc_security_group_egress_rule" "loader_pg" {
+  security_group_id            = aws_security_group.loader_sg.id
+  referenced_security_group_id = aws_security_group.rds_sg.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+}
+
+resource "aws_vpc_security_group_ingress_rule" "rds_from_loader" {
+  security_group_id            = aws_security_group.rds_sg.id
+  referenced_security_group_id = aws_security_group.loader_sg.id
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  description                  = "Seed loader"
 }

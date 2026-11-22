@@ -6,13 +6,13 @@ from inline SVG, so a `prefers-color-scheme` media query inside the document is
 silently dropped. The README pairs them with <picture>, which GitHub honours.
 
 A README diagram is studied, not narrated, so it is COMPLETE rather than
-minimal: the pgweb host, the Aurora writer, reader and the cluster volume
-they share, the RDS primary, its read replica and its Multi-AZ standby, and
-the secret store are all on it.
+minimal: the work queue, the NAT path the long-poll takes, the image
+registry, the secret, the logs, the report bucket and the one-shot seed
+loader are all on it.
 
-The Multi-AZ standby is drawn DASHED on purpose. It is a real instance you pay
-for, but it has no endpoint and can't be read, and that invisibility is why it
-gets confused with the read replica.
+Every arrow points FROM the side that opens the connection. That is the
+point of the lab: every arrow that touches the VPC boundary points out of
+it. The seed loader is drawn DASHED because it runs once and powers off.
 
 Run:  python3 make_diagram.py
 """
@@ -27,11 +27,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NW, NH = 420, 110                          # node width, height
 GUTTER = 140                               # between columns: room for a label
 MARGIN = 40
-COL = [MARGIN + i * (NW + GUTTER) for i in range(3)]
-ROW = [40 + i * 200 for i in range(5)]
-W = MARGIN * 2 + NW * 3 + GUTTER * 2
-H = ROW[4] + NH + 40
-TITLE_PX, SUB_PX, EDGE_PX = 26, 17, 16
+COL = [MARGIN + i * (NW + GUTTER) for i in range(4)]
+ROW = [60, 300, 500, 700]
+W = MARGIN * 2 + NW * 4 + GUTTER * 3
+H = ROW[3] + NH + 70
+TITLE_PX, SUB_PX, EDGE_PX, GROUP_PX = 26, 17, 16, 18
 
 THEMES = {
     "dark": {
@@ -80,6 +80,23 @@ ICONS = {
               '<circle cx="9" cy="7" r="4"/>',
               '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/>',
               '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>'],
+    "bot": ['<path d="M12 8V4H8"/>',
+            '<rect width="16" height="12" x="4" y="8" rx="2"/>',
+            '<path d="M2 14h2"/>', '<path d="M20 14h2"/>',
+            '<path d="M15 13v2"/>', '<path d="M9 13v2"/>'],
+    "inbox": ['<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>',
+              '<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6'
+              'l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>'],
+    "box": ['<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 '
+            '3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/>',
+            '<path d="m3.3 7 8.7 5 8.7-5"/>', '<path d="M12 22V12"/>'],
+    "file": ['<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 '
+             '2-2V7Z"/>', '<path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
+             '<path d="M16 13H8"/>', '<path d="M16 17H8"/>',
+             '<path d="M10 9H8"/>'],
+    "list": ['<path d="M3 6h.01"/>', '<path d="M3 12h.01"/>',
+             '<path d="M3 18h.01"/>', '<path d="M8 6h13"/>',
+             '<path d="M8 12h13"/>', '<path d="M8 18h13"/>'],
 }
 
 NODES = {}
@@ -98,73 +115,103 @@ def gutter_x(c):
 
 def gutter_y(r):
     """Centre of the gap below row r."""
-    return ROW[r] + NH + (ROW[1] - ROW[0] - NH) / 2
+    return ROW[r] + NH + (ROW[r + 1] - ROW[r] - NH) / 2
 
 
 # ------------------------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------------------------
-# One band per engine. Aurora on top: the writer and the reader, with the
-# cluster volume under the writer. RDS below: the primary and its read
-# replica, with the Multi-AZ standby under the primary. The single pgweb host
-# sits between the bands on the left and connects to both writers.
+# Top band: Anthropic (work queue and agent loop) and the build server that
+# drives the control plane. Middle: the VPC, with the NAT gateway directly
+# under the queue so the outbound long-poll is one straight vertical line.
+# Left column: the regional AWS services ECS reads at task start and the
+# log group it writes to. Right: the report bucket.
 #
 # id: (x, y, colour key, icon, title, subtitle[, "dashed"])
 NODES.update({
-    "client":   (COL[0], ROW[0], "navy", "globe", "Browser",
-                 "from the internet"),
-    "secrets":  (COL[1], ROW[0], "store", "key", "Secrets Manager",
-                 "aurora-postgres- and postgres-credentials"),
-    "writer":   (COL[1], ROW[1], "blue", "database", "Aurora writer",
-                 "instance-1, Serverless v2, 0-4 ACU"),
-    "reader":   (COL[2], ROW[1], "blue", "database", "Aurora reader",
-                 "instance-2, the failover target"),
-    "pgweb":    (COL[0], ROW[2], "amber", "monitor", "pgweb-deployment",
-                 "Ubuntu 24.04, t3.medium, pgweb"),
-    "volume":   (COL[1], ROW[2], "local", "layers", "Aurora cluster volume",
-                 "one copy of the data, shared"),
-    "primary":  (COL[1], ROW[3], "purple", "database", "RDS primary",
-                 "postgres-rds-instance, db.t4g.micro"),
-    "replica":  (COL[2], ROW[3], "purple", "database", "RDS read replica",
-                 "postgres-rds-replica, own endpoint"),
-    "standby":  (COL[1], ROW[4], "purple", "database", "Multi-AZ standby",
-                 "no endpoint, not readable", "dashed"),
+    "queue":   (COL[1], ROW[0], "amber", "inbox", "Work queue",
+                "self-hosted environment"),
+    "loop":    (COL[2], ROW[0], "purple", "bot", "Agent loop + schedule",
+                "claude-haiku-5-5, cron 0 6 * * * UTC"),
+    "build":   (COL[3], ROW[0], "navy", "monitor", "Build server",
+                "ant apply, run-now.sh, API key"),
+    "ecr":     (COL[0], ROW[1], "navy", "box", "Amazon ECR",
+                "claude-agent-worker image"),
+    "nat":     (COL[1], ROW[1], "local", "route", "NAT gateway",
+                "public subnet, the only way out"),
+    "secrets": (COL[0], ROW[2], "store", "key", "Secrets Manager",
+                "environment ID + environment key"),
+    "worker":  (COL[1], ROW[2], "blue", "terminal", "Fargate worker",
+                "no public IP, zero ingress rules"),
+    "s3":      (COL[3], ROW[2], "store", "file", "S3 report bucket",
+                "reports/YYYY-MM-DD.md, versioned"),
+    "logs":    (COL[0], ROW[3], "navy", "list", "CloudWatch Logs",
+                "/ecs/claude-agent-worker"),
+    "rds":     (COL[1], ROW[3], "purple", "database", "RDS PostgreSQL 17",
+                "private, IAM auth, role agent_ro"),
+    "loader":  (COL[2], ROW[3], "amber", "monitor", "Seed loader",
+                "loads Pagila once, powers off", "dashed"),
 })
 
-cli, sec, wr, rd = _r("client"), _r("secrets"), _r("writer"), _r("reader")
-pg, vol, pri, rep, stb = (_r("pgweb"), _r("volume"), _r("primary"),
-                          _r("replica"), _r("standby"))
-SPLIT = 30                    # the two database lines leaving pgweb
+# Dashed boundary boxes drawn behind the nodes.
+# (x, y, w, h, label)
+PAD = 25
+GROUPS = [
+    (COL[1] - PAD, ROW[0] - 45, COL[2] + NW - COL[1] + 2 * PAD, NH + 45 + PAD,
+     "Anthropic"),
+    (COL[1] - PAD, ROW[1] - 45, COL[2] + NW - COL[1] + 2 * PAD,
+     ROW[3] + NH + PAD - ROW[1] + 45,
+     "Your VPC: private subnets, nothing inbound"),
+]
 
+q, lp, bs = _r("queue"), _r("loop"), _r("build")
+ecr, nat, sec, wk = _r("ecr"), _r("nat"), _r("secrets"), _r("worker")
+s3, lg, db, ld = _r("s3"), _r("logs"), _r("rds"), _r("loader")
+SPLIT = 35                    # the three lines meeting the worker's left side
+
+# ECS pulls the image and reads the key from inside the task, so those
+# arrows point outward too.
 # id: (path, colour key, label, label_x, label_y, anchor[, "dashed"])
 EDGES = {
-    "e_pw":     (f"M{sec[0]},{sec[5]} H{cli[2] + 5}", "store",
-                 "password", gutter_x(0), sec[5] - 12, "middle"),
-    "e_http":   (f"M{cli[4]},{cli[3]} V{pg[1] - 5}", "line",
-                 "HTTP :80", cli[4] + 14, gutter_y(0) + 6, "start"),
-    "e_sql_a":  (f"M{pg[2]},{pg[5] - SPLIT} H{gutter_x(0)} V{wr[5]} "
-                 f"H{wr[0] - 5}", "line",
-                 "5432", gutter_x(0), wr[5] - 12, "middle"),
-    "e_sql_r":  (f"M{pg[2]},{pg[5] + SPLIT} H{gutter_x(0)} V{pri[5]} "
-                 f"H{pri[0] - 5}", "line",
-                 "5432", gutter_x(0), pri[5] - 12, "middle"),
-    "e_rw":     (f"M{wr[4]},{wr[3]} V{vol[1] - 5}", "local",
-                 "read / write", wr[4] + 14, gutter_y(1) + 6, "start"),
-    "e_rd":     (f"M{rd[4]},{rd[3]} V{vol[5]} H{vol[2] + 5}", "local",
-                 "read", rd[4] + 14, gutter_y(1) + 6, "start"),
-    "e_async":  (f"M{pri[2]},{pri[5]} H{rep[0] - 5}", "purple",
-                 "async copy", gutter_x(1), pri[5] - 12, "middle"),
-    "e_sync":   (f"M{pri[4]},{pri[3]} V{stb[1] - 5}", "purple",
-                 "sync mirror", pri[4] + 14, gutter_y(3) + 6, "start", "dashed"),
+    "e_ctl":   (f"M{bs[0]},{bs[5]} H{lp[2] + 5}", "navy",
+                "HTTPS", gutter_x(2), bs[5] - 12, "middle"),
+    "e_work":  (f"M{lp[0]},{lp[5]} H{q[2] + 5}", "amber",
+                "sessions", gutter_x(1), lp[5] - 12, "middle"),
+    "e_poll":  (f"M{wk[4]},{wk[1]} V{nat[3] + 5}", "blue",
+                "443 out: long-poll", wk[4] + 14, gutter_y(1) + 6, "start"),
+    "e_nat":   (f"M{nat[4]},{nat[1]} V{q[3] + 5}", "blue",
+                "HTTPS to Anthropic", nat[4] + 14, q[3] + PAD + 32, "start"),
+    "e_img":   (f"M{wk[0]},{wk[5] - SPLIT} H{gutter_x(0)} V{ecr[5]} "
+                f"H{ecr[2] + 5}", "navy",
+                "pull image", gutter_x(0), ecr[5] - 12, "middle"),
+    "e_sec":   (f"M{wk[0]},{wk[5]} H{sec[2] + 5}", "store",
+                "read key", gutter_x(0), sec[5] + 24, "middle"),
+    "e_log":   (f"M{wk[0]},{wk[5] + SPLIT} H{gutter_x(0)} V{lg[5]} "
+                f"H{lg[2] + 5}", "navy",
+                "logs", gutter_x(0) - 12, gutter_y(2) + 6, "end"),
+    "e_pg":    (f"M{wk[4]},{wk[3]} V{db[1] - 5}", "purple",
+                "5432, IAM token", wk[4] + 14, gutter_y(2) + 6, "start"),
+    "e_put":   (f"M{wk[2]},{wk[5]} H{s3[0] - 5}", "store",
+                "s3:PutObject reports/*", COL[2] + NW / 2, wk[5] - 12,
+                "middle"),
+    "e_seed":  (f"M{ld[0]},{ld[5]} H{db[2] + 5}", "amber",
+                "5432, once", gutter_x(1), ld[5] - 12, "middle", "dashed"),
+    "e_get":   (f"M{ld[2]},{ld[5]} H{s3[4]} V{s3[3] + 5}", "amber",
+                "seed/ download", s3[4] + 14, gutter_y(2) + 6, "start",
+                "dashed"),
 }
 
-ALT = ("A browser reaches one pgweb host over HTTP, which connects to both "
-       "PostgreSQL engines on port 5432. The Aurora PostgreSQL writer and "
-       "reader both sit on one shared cluster volume, and the reader is the "
-       "failover target. The RDS for PostgreSQL primary copies asynchronously "
-       "to a read replica with its own endpoint and mirrors synchronously to a "
-       "Multi-AZ standby that has no endpoint. The admin passwords are in "
-       "Secrets Manager.")
+ALT = ("A Fargate worker in a private subnet of your VPC opens an outbound "
+       "HTTPS long-poll through the NAT gateway to the Managed Agents work "
+       "queue at Anthropic, where the agent loop and its 06:00 UTC schedule "
+       "run; the build server drives that control plane with an API key. At "
+       "start ECS pulls the worker image from ECR and injects the environment "
+       "key from Secrets Manager, both from inside the task; the worker writes logs to CloudWatch. The "
+       "agent's tool calls run in the worker: psql to a private RDS "
+       "PostgreSQL 17 database on port 5432 with an IAM auth token, and "
+       "s3:PutObject of the report to an S3 bucket. A seed loader host, run "
+       "once, downloads the Pagila data from S3 and loads it into the "
+       "database. No arrow enters the VPC.")
 
 # ------------------------------------------------------------------------------
 # Rendering
@@ -222,6 +269,15 @@ def build(t):
             f'<path d="M0,0 L10,5 L0,10 z" fill="{t[spec[1]]}"/></marker>')
     out.append("</defs>")
     out.append(f'<rect width="{W}" height="{H}" fill="{t["bg"]}"/>')
+    for gx, gy, gw, gh, glabel in GROUPS:
+        out.append(
+            f'<rect x="{gx}" y="{gy}" width="{gw}" height="{gh}" rx="14" '
+            f'fill="none" stroke="{t["muted"]}" stroke-width="2" '
+            f'stroke-dasharray="6 6"/>'
+            f'<text x="{gx + gw - 16}" y="{gy + 28}" text-anchor="end" '
+            f'font-family="{FONT}" '
+            f'font-size="{GROUP_PX}" font-weight="600" fill="{t["muted"]}">'
+            f'{glabel}</text>')
     for eid in EDGES:
         out.append(edge_svg(eid, t))
     for nid in NODES:
